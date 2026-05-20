@@ -1486,6 +1486,11 @@ class GatewayRunner:
         self._session_sources: "OrderedDict[str, SessionSource]" = OrderedDict()
         self._session_sources_max = 512
 
+        # Per conversation bot-to-bot loop guard state. Keyed by platform/chat/thread
+        # rather than session_key so per-user group session settings cannot let bot
+        # handoffs reset the budget by switching sender IDs.
+        self._bot_loop_guard_state: Dict[str, Dict[str, Any]] = {}
+
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
         # system prompt (including memory) every turn — breaking prefix cache
@@ -1925,6 +1930,164 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    _BOT_LOOP_GUARD_DEFAULTS = {
+        "enabled": True,
+        "max_rounds": 2,
+        "max_bot_messages_without_human": 6,
+        "max_handoffs": 5,
+        "on_exhausted": "final_summary",
+        "hard_stop_phrases": [
+            "그만",
+            "멈춰",
+            "정지",
+            "중단",
+            "추가 응답하지 마",
+            "봇 침묵",
+            "완전 종료",
+        ],
+    }
+
+    def _bot_loop_guard_config(self) -> Dict[str, Any]:
+        """Return merged bot-loop guard config from config.yaml defaults."""
+        cfg = dict(self._BOT_LOOP_GUARD_DEFAULTS)
+        try:
+            raw = _load_gateway_config()
+            user_cfg = cfg_get(
+                raw,
+                "gateway",
+                "group_chat",
+                "bot_loop_guard",
+                default={},
+            )
+            if isinstance(user_cfg, dict):
+                cfg.update({k: v for k, v in user_cfg.items() if v is not None})
+        except Exception:
+            logger.debug("Failed to load bot loop guard config", exc_info=True)
+        return cfg
+
+    def _bot_loop_guard_key(self, source: SessionSource) -> str:
+        """Conversation-wide key for bot loop budgets, independent of sender."""
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        guild = str(getattr(source, "guild_id", None) or "")
+        parent = str(getattr(source, "parent_chat_id", None) or "")
+        chat = str(getattr(source, "chat_id", None) or "")
+        thread = str(getattr(source, "thread_id", None) or "")
+        # Discord threads use chat_id as the effective channel; parent/thread are
+        # still included when available for readability and collision resistance.
+        return f"{platform}:{guild}:{parent}:{chat}:{thread}"
+
+    def _render_bot_loop_guard_exhausted_message(self, action: str) -> Optional[str]:
+        if action == "silent":
+            return None
+        if action == "ask_human":
+            return "봇끼리 이어지는 대화 제한에 도달했어. 계속하려면 사람이 다시 호출해줘."
+        return "봇끼리 이어지는 대화 제한에 도달해서 여기서 멈출게. 사람이 다시 부르면 이어갈 수 있어."
+
+    def _apply_bot_loop_guard(self, event: MessageEvent) -> Optional[str]:
+        """Consume/reset the group-chat bot loop budget.
+
+        Returns:
+            None when normal dispatch should continue or be silently suppressed.
+            A string when the gateway should reply with a one-time close-out
+            message instead of invoking the agent.
+
+        The suppression case is marked by setting ``_bot_loop_guard_suppressed``
+        on the event so callers can distinguish it from normal ``None``.
+        """
+        try:
+            setattr(event, "_bot_loop_guard_suppressed", False)
+        except Exception:
+            pass
+
+        source = getattr(event, "source", None)
+        if source is None or getattr(event, "internal", False):
+            return None
+        if getattr(source, "chat_type", "dm") == "dm":
+            return None
+
+        cfg = self._bot_loop_guard_config()
+        if not bool(cfg.get("enabled", True)):
+            return None
+
+        if not hasattr(self, "_bot_loop_guard_state") or self._bot_loop_guard_state is None:
+            self._bot_loop_guard_state = {}
+
+        key = self._bot_loop_guard_key(source)
+        is_bot = bool(getattr(source, "is_bot", False))
+        if not is_bot:
+            self._bot_loop_guard_state.pop(key, None)
+            return None
+
+        state = self._bot_loop_guard_state.setdefault(
+            key,
+            {
+                "bot_messages_without_human": 0,
+                "handoffs_used": 0,
+                "bot_participants": set(),
+                "notified_exhausted": False,
+            },
+        )
+        participants = state.setdefault("bot_participants", set())
+        if not isinstance(participants, set):
+            participants = set(participants or [])
+            state["bot_participants"] = participants
+        user_id = str(getattr(source, "user_id", None) or "")
+        if user_id:
+            participants.add(user_id)
+
+        text = (getattr(event, "text", "") or "").casefold()
+        hard_stop_phrases = cfg.get("hard_stop_phrases") or []
+        if any(str(phrase).casefold() in text for phrase in hard_stop_phrases if str(phrase).strip()):
+            state["notified_exhausted"] = True
+            try:
+                setattr(event, "_bot_loop_guard_suppressed", True)
+            except Exception:
+                pass
+            logger.info("Bot loop guard suppressed bot hard-stop message: key=%s", key)
+            return None
+
+        state["bot_messages_without_human"] = int(state.get("bot_messages_without_human", 0)) + 1
+        state["handoffs_used"] = int(state.get("handoffs_used", 0)) + 1
+
+        max_messages = int(cfg.get("max_bot_messages_without_human") or 0)
+        max_handoffs = int(cfg.get("max_handoffs") or 0)
+        max_rounds = int(cfg.get("max_rounds") or 0)
+        participant_count = max(1, len(participants))
+        rounds_used = (int(state["bot_messages_without_human"]) + participant_count - 1) // participant_count
+
+        exhausted = False
+        reason = ""
+        if max_messages > 0 and state["bot_messages_without_human"] > max_messages:
+            exhausted = True
+            reason = "max_bot_messages_without_human"
+        elif max_handoffs > 0 and state["handoffs_used"] > max_handoffs:
+            exhausted = True
+            reason = "max_handoffs"
+        elif max_rounds > 0 and rounds_used > max_rounds:
+            exhausted = True
+            reason = "max_rounds"
+
+        if not exhausted:
+            return None
+
+        logger.info(
+            "Bot loop guard exhausted: key=%s reason=%s bot_messages=%s handoffs=%s participants=%s rounds=%s",
+            key,
+            reason,
+            state.get("bot_messages_without_human"),
+            state.get("handoffs_used"),
+            participant_count,
+            rounds_used,
+        )
+        try:
+            setattr(event, "_bot_loop_guard_suppressed", True)
+        except Exception:
+            pass
+        if state.get("notified_exhausted"):
+            return None
+        state["notified_exhausted"] = True
+        return self._render_bot_loop_guard_exhausted_message(str(cfg.get("on_exhausted") or "final_summary"))
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -6533,6 +6696,13 @@ class GatewayRunner:
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+
+        _bot_loop_guard_response = self._apply_bot_loop_guard(event)
+        if _bot_loop_guard_response is not None:
+            return _bot_loop_guard_response
+        if getattr(event, "_bot_loop_guard_suppressed", False):
+            return None
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()

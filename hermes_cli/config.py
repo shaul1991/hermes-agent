@@ -587,6 +587,32 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
+
+    "gateway": {
+        "group_chat": {
+            "bot_loop_guard": {
+                # Prevent multi-bot group chats from recursively handing off
+                # forever when bots mention each other. Human-originated
+                # messages reset the budget; bot-originated messages consume it.
+                "enabled": True,
+                "max_rounds": 2,
+                "max_bot_messages_without_human": 6,
+                "max_handoffs": 5,
+                # Values: "final_summary" (one short close-out), "ask_human",
+                # or "silent".
+                "on_exhausted": "final_summary",
+                "hard_stop_phrases": [
+                    "그만",
+                    "멈춰",
+                    "정지",
+                    "중단",
+                    "추가 응답하지 마",
+                    "봇 침묵",
+                    "완전 종료",
+                ],
+            },
+        },
+    },
     
     "terminal": {
         "backend": "local",
