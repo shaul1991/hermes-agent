@@ -1377,6 +1377,48 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    def supports_text_attachments(self) -> bool:
+        """Return True when this adapter can deliver text files natively.
+
+        Long final answers should not be split into a cascade of chat bubbles on
+        platforms that support native file/document attachments (Discord,
+        Telegram, Slack, etc.).  The base ``send_document`` fallback only posts
+        a file path as text, so require subclasses to override it before routing
+        oversized text through this path.
+        """
+        return type(self).send_document is not BasePlatformAdapter.send_document
+
+    async def send_long_text_as_document(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+    ) -> "SendResult":
+        """Write ``text`` to a .txt cache file and send it as an attachment."""
+        if not self.supports_text_attachments():
+            return SendResult(success=False, error="text attachments are not supported by this platform")
+        if not text:
+            return SendResult(success=False, error="empty text")
+
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_name = Path(file_name or f"hermes-response-{stamp}.txt").name
+        if not safe_name.lower().endswith(".txt"):
+            safe_name = f"{safe_name}.txt"
+        file_path = cache_document_from_bytes(text.encode("utf-8"), safe_name)
+        caption = caption or "응답이 길어서 전문은 첨부파일로 보낼게."
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            file_name=safe_name,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def send_draft(
         self,
         chat_id: str,
@@ -3232,44 +3274,70 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
-                # Send the text portion
+                # Send the text portion.  If it no longer fits in a single
+                # platform message and this adapter supports native document
+                # attachments, send one short caption plus a .txt attachment
+                # instead of fanning out into multiple chat bubbles.
                 if text_content and not _tts_caption_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
-                    # Mark final response messages for notification delivery.
-                    # Platform adapters that support per-message notification
-                    # control (e.g. Telegram's disable_notification) use this
-                    # flag to override silent-mode and ensure the final
-                    # response triggers a push notification.
-                    # Clone to avoid mutating the metadata shared with the
-                    # typing-indicator task (which must remain unmarked).
-                    if _thread_metadata is not None:
-                        _thread_metadata = dict(_thread_metadata)
-                        _thread_metadata["notify"] = True
-                    else:
-                        _thread_metadata = {"notify": True}
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_thread_metadata,
-                    )
-                    _record_delivery(result)
-
-                    # Schedule auto-deletion of system-notice replies.
-                    # Detached so the handler returns immediately; errors
-                    # (permission denied, message too old) are swallowed.
+                    _len_fn = self.message_len_fn
+                    _single_message_limit = getattr(self, "MAX_MESSAGE_LENGTH", 4096)
                     if (
-                        _ephemeral_ttl
-                        and _ephemeral_ttl > 0
-                        and result.success
-                        and result.message_id
+                        _len_fn(text_content) > _single_message_limit
+                        and self.supports_text_attachments()
                     ):
-                        self._schedule_ephemeral_delete(
-                            chat_id=event.source.chat_id,
-                            message_id=result.message_id,
-                            ttl_seconds=_ephemeral_ttl,
+                        logger.info(
+                            "[%s] Response exceeds one message (%d > %d); sending as text attachment",
+                            self.name,
+                            _len_fn(text_content),
+                            _single_message_limit,
                         )
+                        attach_result = await self.send_long_text_as_document(
+                            chat_id=event.source.chat_id,
+                            text=text_content,
+                            caption="응답이 길어서 전문은 첨부파일로 보낼게.",
+                            reply_to=_reply_anchor,
+                            metadata=_thread_metadata,
+                        )
+                        _record_delivery(attach_result)
+                        if attach_result.success:
+                            text_content = ""
+                    if text_content:
+                        # Mark final response messages for notification delivery.
+                        # Platform adapters that support per-message notification
+                        # control (e.g. Telegram's disable_notification) use this
+                        # flag to override silent-mode and ensure the final
+                        # response triggers a push notification.
+                        # Clone to avoid mutating the metadata shared with the
+                        # typing-indicator task (which must remain unmarked).
+                        if _thread_metadata is not None:
+                            _thread_metadata = dict(_thread_metadata)
+                            _thread_metadata["notify"] = True
+                        else:
+                            _thread_metadata = {"notify": True}
+                        result = await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_thread_metadata,
+                        )
+                        _record_delivery(result)
+
+                        # Schedule auto-deletion of system-notice replies.
+                        # Detached so the handler returns immediately; errors
+                        # (permission denied, message too old) are swallowed.
+                        if (
+                            _ephemeral_ttl
+                            and _ephemeral_ttl > 0
+                            and result.success
+                            and result.message_id
+                        ):
+                            self._schedule_ephemeral_delete(
+                                chat_id=event.source.chat_id,
+                                message_id=result.message_id,
+                                ttl_seconds=_ephemeral_ttl,
+                            )
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()

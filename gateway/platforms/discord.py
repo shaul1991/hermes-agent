@@ -1411,8 +1411,17 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
-            # Format and split message if needed
+            # Format and split message if needed.  For oversized final text,
+            # prefer a single native .txt attachment over a multi-message burst.
             formatted = self.format_message(content)
+            if len(formatted) > self.MAX_MESSAGE_LENGTH and self.supports_text_attachments():
+                return await self.send_long_text_as_document(
+                    chat_id=chat_id,
+                    text=formatted,
+                    caption="응답이 길어서 전문은 첨부파일로 보낼게.",
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
@@ -1625,6 +1634,7 @@ class DiscordAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a local file as a Discord attachment.
 
@@ -1634,11 +1644,12 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        channel = self._client.get_channel(int(chat_id))
+        target_chat_id = str((metadata or {}).get("thread_id") or chat_id)
+        channel = self._client.get_channel(int(target_chat_id))
         if not channel:
-            channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._client.fetch_channel(int(target_chat_id))
         if not channel:
-            return SendResult(success=False, error=f"Channel {chat_id} not found")
+            return SendResult(success=False, error=f"Channel {target_chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
         with open(file_path, "rb") as fh:
@@ -2694,7 +2705,7 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name, metadata=metadata)
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging

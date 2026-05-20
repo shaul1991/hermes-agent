@@ -77,6 +77,45 @@ def _make_draft_capable_adapter(
     return adapter
 
 
+def _make_text_attachment_adapter():
+    """Build a BasePlatformAdapter subclass that supports text attachments."""
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+    async def _send_document(
+        self,
+        chat_id,
+        file_path,
+        caption=None,
+        file_name=None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ):
+        self.document_calls.append({
+            "chat_id": chat_id,
+            "file_path": file_path,
+            "caption": caption,
+            "file_name": file_name,
+            "reply_to": reply_to,
+            "metadata": metadata,
+        })
+        return SendResult(success=True, message_id="doc_msg")
+
+    AttachmentAdapter = type(
+        "AttachmentAdapter",
+        (BasePlatformAdapter,),
+        {"MAX_MESSAGE_LENGTH": 1000, "send_document": _send_document},
+    )
+    AttachmentAdapter.__abstractmethods__ = frozenset()
+    adapter = AttachmentAdapter.__new__(AttachmentAdapter)
+    adapter._typing_paused = set()
+    adapter._fatal_error_message = None
+    adapter.document_calls = []
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg"))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+    return adapter
+
+
 class TestDraftTransportSelection:
     """Verify _resolve_draft_streaming picks the right transport."""
 
@@ -321,3 +360,55 @@ class TestAlreadySentInDraftMode:
 
         # After the regular sendMessage finalize, _already_sent is True.
         assert consumer._already_sent is True
+
+
+class TestLongTextAttachmentDelivery:
+    """Oversized streamed responses should become one .txt attachment."""
+
+    @pytest.mark.asyncio
+    async def test_long_streamed_response_uses_single_text_attachment(self):
+        adapter = _make_text_attachment_adapter()
+        cfg = StreamConsumerConfig(
+            transport="edit", chat_type="group",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chan",
+            cfg,
+            metadata={"thread_id": "thread-1"},
+            initial_reply_to_id="reply-1",
+        )
+        long_text = "A" * 1500
+
+        consumer.on_delta(long_text)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert consumer._already_sent is True
+        assert consumer._final_response_sent is True
+        assert len(adapter.document_calls) == 1
+        call = adapter.document_calls[0]
+        assert call["chat_id"] == "chan"
+        assert call["reply_to"] == "reply-1"
+        assert call["metadata"] == {"thread_id": "thread-1"}
+        assert call["caption"] == "응답이 길어서 전문은 첨부파일로 보낼게."
+        assert call["file_name"].endswith(".txt")
+        with open(call["file_path"], "r", encoding="utf-8") as fh:
+            assert fh.read() == long_text
+
+    @pytest.mark.asyncio
+    async def test_long_fallback_final_uses_single_text_attachment(self):
+        adapter = _make_text_attachment_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chan",
+            StreamConsumerConfig(chat_type="group", cursor=""),
+        )
+
+        await consumer._send_fallback_final("B" * 1500)
+
+        assert len(adapter.document_calls) == 1
+        adapter.send.assert_not_awaited()

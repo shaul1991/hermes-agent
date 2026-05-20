@@ -466,6 +466,24 @@ class GatewayStreamConsumer:
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
+                    # If the answer outgrows a single chat message and the
+                    # platform can attach text files, avoid creating a stream
+                    # of continuation bubbles.  Show one short notice while the
+                    # stream is still running, then deliver the final full text
+                    # as a .txt attachment on completion.
+                    if (
+                        _len_fn(self._accumulated) > _safe_limit
+                        and self._supports_text_attachment_delivery()
+                    ):
+                        if got_done:
+                            if await self._send_long_text_attachment(self._accumulated):
+                                return
+                        else:
+                            await self._show_long_text_attachment_notice()
+                            self._last_edit_time = time.monotonic()
+                            await asyncio.sleep(0.05)
+                            continue
+
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -664,6 +682,50 @@ class GatewayStreamConsumer:
         # Strip trailing whitespace/newlines but preserve leading content
         return cleaned.rstrip()
 
+    def _supports_text_attachment_delivery(self) -> bool:
+        return bool(
+            isinstance(self.adapter, _BasePlatformAdapter)
+            and self.adapter.supports_text_attachments()
+        )
+
+    async def _send_long_text_attachment(self, text: str) -> bool:
+        final_text = self._clean_for_display(text)
+        if not final_text.strip() or not self._supports_text_attachment_delivery():
+            return False
+        try:
+            result = await self.adapter.send_long_text_as_document(
+                chat_id=self.chat_id,
+                text=final_text,
+                caption="응답이 길어서 전문은 첨부파일로 보낼게.",
+                reply_to=self._initial_reply_to_id,
+                metadata=self.metadata,
+            )
+        except Exception as exc:
+            logger.debug("Long streamed response attachment failed: %s", exc, exc_info=True)
+            return False
+        if not getattr(result, "success", False):
+            logger.debug(
+                "Long streamed response attachment failed: %s",
+                getattr(result, "error", "unknown error"),
+            )
+            return False
+        self._already_sent = True
+        self._final_response_sent = True
+        self._final_content_delivered = True
+        self._notify_new_message()
+        return True
+
+    async def _show_long_text_attachment_notice(self) -> None:
+        notice = "응답이 길어져서 완료되면 전문을 첨부파일(.txt)로 보낼게."
+        if self._last_sent_text == notice:
+            return
+        try:
+            ok = await self._send_or_edit(notice, finalize=False)
+            if ok:
+                self._last_sent_text = notice
+        except Exception:
+            logger.debug("Long streamed response notice failed", exc_info=True)
+
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
@@ -782,6 +844,10 @@ class GatewayStreamConsumer:
             else len
         )
         safe_limit = max(500, raw_limit - 100)
+        if _len_fn(continuation) > safe_limit and self._supports_text_attachment_delivery():
+            if await self._send_long_text_attachment(final_text):
+                self._fallback_prefix = ""
+                return
         chunks = self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
 
         stale_message_id = self._message_id  # partial message to clean up
